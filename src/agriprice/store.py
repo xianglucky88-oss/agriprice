@@ -3,6 +3,14 @@
 import json, sqlite3
 from .config import DB_PATH
 
+
+def _without_rule(record):
+    """Record content minus the rule label: the stored business outcome."""
+    d = dict(record)
+    d.pop("rule", None)
+    return d
+
+
 class Store:
     def __init__(self, con=None):
         self.con = con
@@ -28,13 +36,36 @@ class Store:
         import hashlib
         return hashlib.sha256(blob.encode()).hexdigest()[:24]
 
-    def upsert(self, record):
-        cur = self.con.execute(
-            "INSERT OR IGNORE INTO records(content_hash,id,ts,payload) VALUES(?,?,?,?)",
-            (self.hash(record), str(record.get("id", "")),
-             str(record.get("ts", "")), json.dumps(record, ensure_ascii=False)))
+    def upsert(self, record, identity=None):
+        """Store ``record`` keyed by ``identity`` (defaults to the record).
+
+        Returns True only when the stored row actually changed.  An existing
+        row is never rewritten without cause: identical re-deliveries are
+        ignored, and a rewrite happens only when the normalisation rule
+        version differs *and* the resulting content differs.
+        """
+        basis = identity if identity is not None else record
+        key = self.hash(basis)
+        payload = json.dumps(record, ensure_ascii=False)
+        row = self.con.execute(
+            "SELECT payload FROM records WHERE content_hash=?", (key,)).fetchone()
+        if row is None:
+            self.con.execute(
+                "INSERT INTO records(content_hash,id,ts,payload) VALUES(?,?,?,?)",
+                (key, str(record.get("id", "")),
+                 str(record.get("ts", "")), payload))
+            self.con.commit()
+            return True
+        old = json.loads(row[0])
+        if old.get("rule") == record.get("rule"):
+            return False  # same processing basis: leave the stored result alone
+        if _without_rule(old) == _without_rule(record):
+            return False  # rule changed but the outcome did not: no cause
+        self.con.execute(
+            "UPDATE records SET id=?, ts=?, payload=? WHERE content_hash=?",
+            (str(record.get("id", "")), str(record.get("ts", "")), payload, key))
         self.con.commit()
-        return cur.rowcount > 0
+        return True
 
     def count(self):
         return self.con.execute("SELECT COUNT(*) FROM records").fetchone()[0]

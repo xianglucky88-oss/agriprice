@@ -81,6 +81,10 @@ class Http:
 # --------------------------------------------------------------------------- #
 def _coerce(name, val):
     if name in SPEC.int_fields:
+        if isinstance(val, float) and not val.is_integer():
+            # Keep the exact expression; truncating here would invent a
+            # different amount before the kernel ever sees the quote.
+            return val
         try:
             return int(val)
         except (TypeError, ValueError):
@@ -167,7 +171,17 @@ def _apply_kernel(records):
     k = importlib.import_module(".kernel", __package__)
     for r in records:
         if hasattr(k, "process"):
-            r.update(k.process(r))
+            try:
+                r.update(k.process(r))
+            except Exception as exc:
+                # A single erroneous quote must not abort the batch: mark it
+                # unusable and keep processing the remaining valid quotes.
+                r.update({"value_raw": r.get("value"), "unit_raw": r.get("unit"),
+                          "value_norm": None, "unit_norm": None,
+                          "scale_factor": 1.0, "quality": "invalid",
+                          "flags": ["kernel_error"],
+                          "rule": getattr(k, "RULE_VERSION", None),
+                          "error": str(exc)[:200]})
     if hasattr(k, "reduce"):
         records = k.reduce(records)
     return records
@@ -186,19 +200,37 @@ def run(mode="full", con=None):
         records, attempts = fetch_all(http)
         norm = [normalize(dict(r)) for r in records]
         norm, dup_in_batch = dedup(norm)
+        # Identity is the source expression before normalisation rules are
+        # applied, so re-running the same rules never rewrites stored rows
+        # and a rule change only rewrites rows whose outcome changed.
+        identities = [dict(r) for r in norm]
         norm = _apply_kernel(norm)
 
-        wm = store.watermark()
-        if mode == "incremental" and wm:
-            norm = [r for r in norm if str(r.get("ts", "")) > wm]
-
-        ingested = sum(1 for r in norm if store.upsert(r))
+        # Incremental mode must not drop records by watermark: late or
+        # out-of-order corrections (e.g. a quote re-published per ton with
+        # an older timestamp) still have to be ingested.  Identity-based
+        # dedup makes reprocessing safe, so full and incremental runs yield
+        # the same business results.
+        before = store.count()
+        changed = 0
+        for ident, rec in zip(identities, norm):
+            if store.upsert(rec, identity=ident):
+                changed += 1
         total = store.count()
+        ingested = total - before
+        updated = changed - ingested
+        invalid = sum(1 for r in norm if r.get("quality") == "invalid")
+
+        # The watermark only advances after every page was fetched and every
+        # record was processed, so an interrupted run never reports progress
+        # it did not make.
+        wm = store.watermark()
         new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
         if new_wm:
             store.set_watermark(new_wm)
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
-                "duplicates": dup_in_batch, "ingested": ingested, "count": total,
+                "duplicates": dup_in_batch, "ingested": ingested,
+                "updated": updated, "invalid": invalid, "count": total,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
                 "watermark": store.watermark()}
     finally:
@@ -283,9 +315,15 @@ def run_rpa(con=None):
         items = r.collect()
         norm = [normalize(dict(it)) for it in items]
         norm, dup = dedup(norm)
+        identities = [dict(x) for x in norm]
         norm = _apply_kernel(norm)
-        ingested = sum(1 for x in norm if store.upsert(x))
+        before = store.count()
+        changed = 0
+        for ident, x in zip(identities, norm):
+            if store.upsert(x, identity=ident):
+                changed += 1
         total = store.count()
+        ingested = total - before
         created = dedup_submit = 0
         for x in norm[:2]:
             if r.submit(x):
